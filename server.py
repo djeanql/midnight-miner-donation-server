@@ -3,8 +3,12 @@ import socketserver
 import json
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pycardano import PaymentSigningKey, PaymentVerificationKey, Address, Network
+
+# Rate limiting state
+rate_limit_tracker = {}
+RATE_LIMIT_SECONDS = 10
 
 class WalletManager:
 
@@ -44,6 +48,21 @@ class WalletManager:
 class MyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/get_dev_address':
+            client_ip = self.client_address[0]
+            current_time = datetime.now(timezone.utc)
+
+            if client_ip in rate_limit_tracker:
+                last_request_time = rate_limit_tracker[client_ip]
+                if current_time - last_request_time < timedelta(seconds=RATE_LIMIT_SECONDS):
+                    self.send_response(429)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    response = {'error': 'Too Many Requests'}
+                    self.wfile.write(json.dumps(response).encode('utf-8'))
+                    return
+
+            rate_limit_tracker[client_ip] = current_time
+
             try:
                 # Generate a new wallet
                 new_wallet = wallet_manager.generate_wallet()
