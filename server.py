@@ -3,6 +3,7 @@ import socketserver
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 from pycardano import PaymentSigningKey, PaymentVerificationKey, Address, Network
 import requests
@@ -20,9 +21,17 @@ class WalletManager:
         self.wallet_file = wallet_file
         self.wallets = []
         self._lock = threading.Lock()
+        self._needs_save = False
+        self._shutdown = False
+
+        # Load existing wallets
         if os.path.exists(self.wallet_file):
             with open(self.wallet_file, 'r') as f:
                 self.wallets = json.load(f)
+
+        # Start background save thread
+        self._save_thread = threading.Thread(target=self._background_save, daemon=True)
+        self._save_thread.start()
 
     def generate_wallet(self):
         signing_key = PaymentSigningKey.generate()
@@ -37,17 +46,48 @@ class WalletManager:
             'created_at': datetime.now(timezone.utc).isoformat()
         }
 
-    def save_wallets(self):
-        """Save current wallet list to file"""
+    def _background_save(self):
+        """Background thread that periodically saves wallets to disk"""
+        while not self._shutdown:
+            time.sleep(2)  # Save every 2 seconds if needed
+            if self._needs_save:
+                self._save_now()
+
+    def _save_now(self):
+        """Immediately save wallets to disk"""
         with self._lock:
+            if not self._needs_save:
+                return
+            wallets_copy = self.wallets.copy()
+            self._needs_save = False
+
+        # Write to file outside the lock to avoid blocking
+        try:
             with open(self.wallet_file, 'w') as f:
-                json.dump(self.wallets, f, indent=2)
+                json.dump(wallets_copy, f, indent=2)
+        except Exception as e:
+            print(f"Error saving wallets: {e}")
+            # Mark as needing save again
+            with self._lock:
+                self._needs_save = True
+
+    def save_wallets(self):
+        """Mark wallets as needing to be saved (async)"""
+        with self._lock:
+            self._needs_save = True
+
+    def shutdown(self):
+        """Clean shutdown - save any pending changes"""
+        self._shutdown = True
+        if self._needs_save:
+            self._save_now()
+        self._save_thread.join(timeout=5)
 
     def add_wallet(self, wallet_data):
         """Add a new wallet to the manager"""
         with self._lock:
             self.wallets.append(wallet_data)
-        self.save_wallets()
+            self._needs_save = True
 
     def sign_terms(self, wallet_data, api_base):
         try:
@@ -221,9 +261,15 @@ if __name__ == '__main__':
     wallet_manager = WalletManager()
 
     PORT = 8000
-    with socketserver.TCPServer(("", PORT), MyHandler) as httpd:
+    # Use ThreadingTCPServer for concurrent request handling
+    with socketserver.ThreadingTCPServer(("", PORT), MyHandler) as httpd:
+        # Allow socket reuse to prevent "Address already in use" errors
+        httpd.allow_reuse_address = True
         print("serving at port", PORT)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
+            print("\nShutting down...")
+            wallet_manager.shutdown()
             httpd.server_close()
+            print("Server stopped")
