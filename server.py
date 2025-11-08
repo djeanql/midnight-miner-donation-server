@@ -134,6 +134,87 @@ class WalletManager:
         self.sign_terms(wallet_data, API_BASE)
         return self._register_wallet_with_api(wallet_data, API_BASE)
 
+    def find_wallet_by_address(self, address):
+        """Find a wallet by its address. Returns wallet data or None."""
+        with self._lock:
+            for wallet in self.wallets:
+                if wallet['address'] == address:
+                    return wallet.copy()
+        return None
+
+
+class SolvedWalletManager:
+    """Manages wallets that have solved challenges"""
+
+    def __init__(self, solved_file="solved_wallets.json"):
+        self.solved_file = solved_file
+        self.solved_wallets = []
+        self._lock = threading.Lock()
+        self._needs_save = False
+        self._shutdown = False
+
+        # Load existing solved wallets
+        if os.path.exists(self.solved_file):
+            with open(self.solved_file, 'r') as f:
+                self.solved_wallets = json.load(f)
+
+        # Start background save thread
+        self._save_thread = threading.Thread(target=self._background_save, daemon=True)
+        self._save_thread.start()
+
+    def _background_save(self):
+        """Background thread that periodically saves solved wallets to disk"""
+        while not self._shutdown:
+            time.sleep(2)  # Save every 2 seconds if needed
+            if self._needs_save:
+                self._save_now()
+
+    def _save_now(self):
+        """Immediately save solved wallets to disk"""
+        with self._lock:
+            if not self._needs_save:
+                return
+            wallets_copy = self.solved_wallets.copy()
+            self._needs_save = False
+
+        # Write to file outside the lock to avoid blocking
+        try:
+            with open(self.solved_file, 'w') as f:
+                json.dump(wallets_copy, f, indent=2)
+        except Exception as e:
+            print(f"Error saving solved wallets: {e}")
+            # Mark as needing save again
+            with self._lock:
+                self._needs_save = True
+
+    def shutdown(self):
+        """Clean shutdown - save any pending changes"""
+        self._shutdown = True
+        if self._needs_save:
+            self._save_now()
+        self._save_thread.join(timeout=5)
+
+    def add_solved_wallet(self, wallet_data):
+        """Add a wallet that has solved a challenge. Returns (is_new, total_count)"""
+        with self._lock:
+            # Check if already recorded
+            for wallet in self.solved_wallets:
+                if wallet['address'] == wallet_data['address']:
+                    # Increment the count for existing wallet
+                    wallet['solutions_count'] = wallet.get('solutions_count', 1) + 1
+                    wallet['last_solved'] = datetime.now(timezone.utc).isoformat()
+                    self._needs_save = True
+                    return (False, wallet['solutions_count'])
+
+            # Add new wallet with initial count
+            solved_wallet = wallet_data.copy()
+            solved_wallet['solutions_count'] = 1
+            solved_wallet['first_solved'] = datetime.now(timezone.utc).isoformat()
+            solved_wallet['last_solved'] = datetime.now(timezone.utc).isoformat()
+            self.solved_wallets.append(solved_wallet)
+            self._needs_save = True
+            return (True, 1)
+
 class MyHandler(http.server.BaseHTTPRequestHandler):
     def _check_rate_limit(self):
         """Check if the request should be rate limited. Returns True if allowed, False if rate limited."""
@@ -251,6 +332,74 @@ class MyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 response = {'error': str(e)}
                 self.wfile.write(json.dumps(response).encode('utf-8'))
+
+        elif self.path == '/report_solution':
+            if not self._check_rate_limit():
+                return
+
+            try:
+                # Read and parse the request body
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length)
+
+                # Parse JSON body
+                try:
+                    data = json.loads(post_data) if post_data else {}
+                except json.JSONDecodeError:
+                    self.send_response(400)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    response = {'error': 'Invalid JSON'}
+                    self.wfile.write(json.dumps(response).encode('utf-8'))
+                    return
+
+                # Get the address from the request
+                address = data.get('address')
+                if not address:
+                    self.send_response(400)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    response = {'error': 'Missing address field'}
+                    self.wfile.write(json.dumps(response).encode('utf-8'))
+                    return
+
+                # Find the wallet by address
+                wallet_data = wallet_manager.find_wallet_by_address(address)
+                if not wallet_data:
+                    self.send_response(404)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    response = {'error': 'Address not found'}
+                    self.wfile.write(json.dumps(response).encode('utf-8'))
+                    return
+
+                # Add to solved wallets
+                is_new, solutions_count = solved_wallet_manager.add_solved_wallet(wallet_data)
+
+                # Prepare response
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {
+                    'success': True,
+                    'address': address,
+                    'newly_recorded': is_new,
+                    'solutions_count': solutions_count
+                }
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+
+                if is_new:
+                    print(f"Solution reported for address: {address} (first solution)")
+                else:
+                    print(f"Solution #{solutions_count} reported for address: {address}")
+
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {'error': str(e)}
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+
         else:
             self.send_response(404)
             self.send_header('Content-type', 'text/plain')
@@ -259,6 +408,7 @@ class MyHandler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     wallet_manager = WalletManager()
+    solved_wallet_manager = SolvedWalletManager()
 
     PORT = 8000
     # Use ThreadingTCPServer for concurrent request handling
@@ -271,5 +421,6 @@ if __name__ == '__main__':
         except KeyboardInterrupt:
             print("\nShutting down...")
             wallet_manager.shutdown()
+            solved_wallet_manager.shutdown()
             httpd.server_close()
             print("Server stopped")
