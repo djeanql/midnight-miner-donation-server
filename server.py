@@ -10,7 +10,8 @@ import cbor2
 
 # Rate limiting state
 rate_limit_tracker = {}
-RATE_LIMIT_SECONDS = 10
+RATE_LIMIT_WINDOW_SECONDS = 300  # 5 minutes
+RATE_LIMIT_MAX_REQUESTS = 16
 API_BASE = "https://scavenger.prod.gd.midnighttge.io/"
 
 class WalletManager:
@@ -94,24 +95,98 @@ class WalletManager:
         return self._register_wallet_with_api(wallet_data, API_BASE)
 
 class MyHandler(http.server.BaseHTTPRequestHandler):
+    def _check_rate_limit(self):
+        """Check if the request should be rate limited. Returns True if allowed, False if rate limited."""
+        client_ip = self.client_address[0]
+        current_time = datetime.now(timezone.utc)
+
+        # Initialize tracking list for this IP if not exists
+        if client_ip not in rate_limit_tracker:
+            rate_limit_tracker[client_ip] = []
+
+        # Remove timestamps older than the rate limit window
+        cutoff_time = current_time - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
+        rate_limit_tracker[client_ip] = [
+            timestamp for timestamp in rate_limit_tracker[client_ip]
+            if timestamp > cutoff_time
+        ]
+
+        # Check if rate limit is exceeded
+        if len(rate_limit_tracker[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
+            self.send_response(429)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {'error': 'Too Many Requests'}
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            print(f"Rate limit exceeded for IP: {client_ip}")
+            return False
+
+        # Add current request timestamp
+        rate_limit_tracker[client_ip].append(current_time)
+        return True
+
     def do_GET(self):
         if self.path == '/get_dev_address':
-            client_ip = self.client_address[0]
-            current_time = datetime.now(timezone.utc)
+            if not self._check_rate_limit():
+                return
 
-            if client_ip in rate_limit_tracker:
-                last_request_time = rate_limit_tracker[client_ip]
-                if current_time - last_request_time < timedelta(seconds=RATE_LIMIT_SECONDS):
-                    self.send_response(429)
+            try:
+                # Generate a new wallet
+                new_wallet = wallet_manager.generate_wallet()
+
+                # Register the wallet with the Midnight API
+                if wallet_manager.register_wallet(new_wallet):
+                    print(f"Successfully registered wallet: {new_wallet['address']}")
+                else:
+                    print(f"Failed to register wallet: {new_wallet['address']}")
+
+                # Add the new wallet to the manager and save it
+                wallet_manager.add_wallet(new_wallet)
+
+                # Prepare the response
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {'address': new_wallet['address']}
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {'error': str(e)}
+                self.wfile.write(json.dumps(response).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def do_POST(self):
+        if self.path == '/get_dev_address':
+            if not self._check_rate_limit():
+                return
+
+            try:
+                # Read and parse the request body
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length)
+
+                # Parse JSON body
+                try:
+                    data = json.loads(post_data) if post_data else {}
+                except json.JSONDecodeError:
+                    data = {}
+
+                # Check password
+                password = data.get('password')
+                if password != 'MM25':
+                    self.send_response(403)
                     self.send_header('Content-type', 'application/json')
                     self.end_headers()
-                    response = {'error': 'Too Many Requests'}
+                    response = {'error': 'Invalid or missing password'}
                     self.wfile.write(json.dumps(response).encode('utf-8'))
                     return
 
-            rate_limit_tracker[client_ip] = current_time
-
-            try:
                 # Generate a new wallet
                 new_wallet = wallet_manager.generate_wallet()
 
