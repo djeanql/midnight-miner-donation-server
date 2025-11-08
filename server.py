@@ -10,7 +10,7 @@ import cbor2
 
 # Rate limiting state
 rate_limit_tracker = {}
-RATE_LIMIT_WINDOW_SECONDS = 300  # 5 minutes
+RATE_LIMIT_WINDOW_SECONDS = 120
 RATE_LIMIT_MAX_REQUESTS = 16
 API_BASE = "https://scavenger.prod.gd.midnighttge.io/"
 
